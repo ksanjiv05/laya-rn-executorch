@@ -1,12 +1,13 @@
 /**
- * Laya × ExecuTorch — REAL int8 model, per-case runner.
+ * Laya × ExecuTorch — on-device demo (screenshot-ready).
  *
- * Loads a Laya .pte from the device filesystem and runs each pre-tokenized case in
- * assets/laya_testcases.json individually (tap a case to run just it) or all in sequence.
- * Applies Laya's temperature+softmax, times each forward, compares to the Python reference.
+ * Monochrome, sharp-corner presentation build. Loads the int8 Laya .pte from the device filesystem
+ * and shows each test case as a card: the input state, the typed question, and Laya's on-device
+ * decision (choice / score / yes-no) with a calibrated confidence bar. No timing.
  */
 import React, {useState} from 'react';
 import {
+  Platform,
   SafeAreaView,
   ScrollView,
   StatusBar,
@@ -18,13 +19,41 @@ import {
 import {useExecutorchModule, ScalarType} from 'react-native-executorch/legacy';
 
 const DATA = require('./assets/laya_testcases.json');
-const DIR = 'file:///sdcard/Android/data/com.layaexecutorchdemo/files/';
-const MODELS = [
-  {label: 'int8 · GPU (Vulkan)', path: DIR + 'laya_vulkan_int8.pte'},
-  {label: 'int8 · CPU (XNNPACK)', path: DIR + 'laya_int8.pte'},
-];
+// The int8 .pte is pushed to the app's on-device storage, per platform:
+//   Android:  adb push laya_xnnpack_int8wo.pte /sdcard/Android/data/<pkg>/files/laya_int8.pte
+//   iOS:      copy laya_int8.pte into the app's Documents dir (e.g. via Xcode "Add Files" as a
+//             bundle resource + copy on first launch, or `xcrun simctl` push to the container).
+const MODEL_PATH = Platform.select({
+  android: 'file:///sdcard/Android/data/com.layaexecutorchdemo/files/laya_int8.pte',
+  ios: 'laya_int8.pte', // resolved from the app bundle / Documents by the resource fetcher
+  default: 'laya_int8.pte',
+}) as string;
 
-type CaseResult = {summary: string; ms: number; match: boolean};
+// Monochrome palette — pure black/white shades.
+const C = {
+  bg: '#000000',
+  card: '#0B0B0B',
+  cardHi: '#151515',
+  line: '#242424',
+  lineHi: '#3A3A3A',
+  ink: '#FFFFFF',
+  sub: '#9A9A9A',
+  faint: '#5E5E5E',
+  track: '#161616',
+};
+
+const TYPE_TAG: Record<string, string> = {
+  choice: 'CHOICE',
+  score: 'SCORE',
+  noul: 'YES / NO',
+};
+
+type Decision = {
+  kind: 'choice' | 'score' | 'noul';
+  label: string;
+  bars: {name: string; p: number}[];
+  scoreText?: string;
+};
 
 function softmax(z: number[]): number[] {
   const m = Math.max(...z);
@@ -35,167 +64,227 @@ function softmax(z: number[]): number[] {
 const i64 = (arr: number[]) => BigInt64Array.from(arr.map(x => BigInt(x)));
 
 function App(): React.JSX.Element {
-  const [sel, setSel] = useState(0);
-  const model = useExecutorchModule({modelSource: MODELS[sel].path});
-  const [results, setResults] = useState<Record<number, CaseResult>>({});
+  const model = useExecutorchModule({modelSource: MODEL_PATH});
+  const [out, setOut] = useState<Record<number, Decision>>({});
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState('');
+  const [active, setActive] = useState<number | null>(null);
+
+  const decide = async (idx: number): Promise<Decision | null> => {
+    const c = DATA.cases[idx];
+    const inputs = [
+      {dataPtr: i64(c.input_ids), sizes: [1, DATA.seq_len], scalarType: ScalarType.LONG},
+      {dataPtr: i64(c.attention_mask), sizes: [1, DATA.seq_len], scalarType: ScalarType.LONG},
+      {dataPtr: i64(c.marker_pos), sizes: [1, DATA.max_opts], scalarType: ScalarType.LONG},
+      {
+        dataPtr: Uint8Array.from(c.marker_mask.map((b: boolean) => (b ? 1 : 0))),
+        sizes: [1, DATA.max_opts],
+        scalarType: ScalarType.BOOL,
+      },
+      {dataPtr: i64([c.qtype]), sizes: [1], scalarType: ScalarType.LONG},
+    ];
+    const res = await model.forward(inputs as any);
+    const logits = Array.from(new Float32Array(res[0].dataPtr as ArrayBuffer));
+    const k: number = c.k;
+    const p = softmax(logits.slice(0, k).map(v => v / c.temperature));
+
+    if (c.question.type === 'choice') {
+      const keys: string[] = c.question.criteria;
+      const mi = p.indexOf(Math.max(...p));
+      return {kind: 'choice', label: keys[mi], bars: keys.map((name, i) => ({name, p: p[i]}))};
+    } else if (c.question.type === 'score') {
+      const labels: string[] = c.question.criteria;
+      const score = p.reduce((a, v, i) => a + v * i, 0);
+      const mi = p.indexOf(Math.max(...p));
+      return {
+        kind: 'score',
+        label: labels[mi],
+        scoreText: `${score.toFixed(1)} / ${k - 1}`,
+        bars: labels.map((name, i) => ({name, p: p[i]})),
+      };
+    } else {
+      const yes = p[1];
+      return {
+        kind: 'noul',
+        label: yes >= 0.5 ? 'Yes' : 'No',
+        bars: [
+          {name: 'No', p: p[0]},
+          {name: 'Yes', p: p[1]},
+        ],
+      };
+    }
+  };
 
   const runOne = async (idx: number) => {
-    setErr('');
     setBusy(true);
+    setActive(idx);
     try {
-      const c = DATA.cases[idx];
-      const inputs = [
-        {dataPtr: i64(c.input_ids), sizes: [1, DATA.seq_len], scalarType: ScalarType.LONG},
-        {dataPtr: i64(c.attention_mask), sizes: [1, DATA.seq_len], scalarType: ScalarType.LONG},
-        {dataPtr: i64(c.marker_pos), sizes: [1, DATA.max_opts], scalarType: ScalarType.LONG},
-        {
-          dataPtr: Uint8Array.from(c.marker_mask.map((b: boolean) => (b ? 1 : 0))),
-          sizes: [1, DATA.max_opts],
-          scalarType: ScalarType.BOOL,
-        },
-        {dataPtr: i64([c.qtype]), sizes: [1], scalarType: ScalarType.LONG},
-      ];
-      const t0 = Date.now();
-      const res = await model.forward(inputs as any);
-      const ms = Date.now() - t0;
-      const logits = Array.from(new Float32Array(res[0].dataPtr as ArrayBuffer));
-      const k: number = c.k;
-      const p = softmax(logits.slice(0, k).map(v => v / c.temperature));
-
-      let summary = '';
-      let match = false;
-      if (c.question.type === 'choice') {
-        const keys: string[] = c.question.criteria;
-        const mi = p.indexOf(Math.max(...p));
-        summary = `${keys[mi]}  [${p.map(v => v.toFixed(3)).join(', ')}]`;
-        match =
-          keys[mi] === c.reference.choice &&
-          keys.every((kk, i) => Math.abs(p[i] - c.reference.probabilities[kk]) < 0.02);
-      } else if (c.question.type === 'score') {
-        const score = p.reduce((a, v, i) => a + v * i, 0);
-        summary = `score ${score.toFixed(2)} / ${k - 1}  [${p.map(v => v.toFixed(2)).join(', ')}]`;
-        match = Math.abs(score - c.reference.score) < 0.05;
-      } else {
-        summary = `P(true) = ${p[1].toFixed(4)}`;
-        match = Math.abs(p[1] - c.reference.noul) < 0.02;
-      }
-      setResults(prev => ({...prev, [idx]: {summary, ms, match}}));
-    } catch (e: any) {
-      setErr(String(e?.message ?? e));
-    }
+      const d = await decide(idx);
+      if (d) setOut(prev => ({...prev, [idx]: d}));
+    } catch {}
+    setActive(null);
     setBusy(false);
   };
 
   const runAll = async () => {
-    setResults({});
+    setBusy(true);
     for (let i = 0; i < DATA.cases.length; i++) {
-      await runOne(i);
+      setActive(i);
+      try {
+        const d = await decide(i);
+        if (d) setOut(prev => ({...prev, [i]: d}));
+      } catch {}
     }
+    setActive(null);
+    setBusy(false);
   };
 
   return (
     <SafeAreaView style={styles.root}>
       <StatusBar barStyle="light-content" />
-      <ScrollView contentContainerStyle={styles.content}>
-        <Text style={styles.title}>Laya × ExecuTorch</Text>
-        <Text style={styles.subtitle}>per-case runner</Text>
-
-        <View style={styles.sel}>
-          {MODELS.map((m, i) => (
-            <TouchableOpacity
-              key={i}
-              disabled={busy}
-              onPress={() => {
-                setSel(i);
-                setResults({});
-              }}
-              style={[styles.chip, sel === i && styles.chipOn]}>
-              <Text style={[styles.chipT, sel === i && styles.chipTOn]}>{m.label}</Text>
-            </TouchableOpacity>
-          ))}
+      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+        {/* Header */}
+        <View style={styles.header}>
+          <Text style={styles.title}>LAYA</Text>
+          <View style={styles.badge}>
+            <View style={styles.dot} />
+            <Text style={styles.badgeT}>{model.isReady ? 'ON DEVICE' : 'LOADING'}</Text>
+          </View>
         </View>
+        <View style={styles.rule} />
+        <Text style={styles.subtitle}>on-device decision model</Text>
 
-        <View style={styles.card}>
-          <Row label="Selected" value={MODELS[sel].label} />
-          <Row label="State" value={model.isReady ? 'ready ✓' : `loading… ${Math.round((model.downloadProgress ?? 0) * 100)}%`} />
-        </View>
+        <Text style={styles.blurb}>
+          A small model that <Text style={styles.blurbHi}>decides</Text> instead of chatting — running
+          fully offline on this phone. No cloud. No API.
+        </Text>
 
+        {/* Cases */}
         {DATA.cases.map((c: any, i: number) => {
-          const r = results[i];
+          const d = out[i];
+          const isActive = active === i;
           return (
-            <View key={i} style={styles.case}>
-              <View style={styles.caseHead}>
-                <Text style={styles.caseName}>
-                  {i + 1}. {c.name}
-                </Text>
-                {r ? <Text style={r.match ? styles.ok : styles.bad}>{r.match ? '✓' : '✗'}</Text> : null}
+            <View key={i} style={styles.card}>
+              <View style={styles.cardTop}>
+                <View style={styles.typeTag}>
+                  <Text style={styles.typeTagT}>{TYPE_TAG[c.question.type]}</Text>
+                </View>
+                <Text style={styles.caseName}>{c.name.split(' (')[0].toUpperCase()}</Text>
               </View>
-              {r ? (
-                <>
-                  <Text style={styles.caseOut}>{r.summary}</Text>
-                  <Text style={styles.caseMs}>{r.ms} ms</Text>
-                </>
-              ) : null}
-              <TouchableOpacity
-                style={[styles.runBtn, (!model.isReady || busy) && styles.btnOff]}
-                disabled={!model.isReady || busy}
-                onPress={() => runOne(i)}>
-                <Text style={styles.runBtnT}>Run case {i + 1}</Text>
-              </TouchableOpacity>
+
+              <Text style={styles.fieldLabel}>INPUT</Text>
+              <Text style={styles.state}>{c.state}</Text>
+
+              <Text style={styles.fieldLabel}>ASK</Text>
+              <Text style={styles.question}>{c.question.instructions}</Text>
+
+              {d ? (
+                <View style={styles.result}>
+                  <View style={styles.resultHead}>
+                    <Text style={styles.decideLabel}>DECISION</Text>
+                    <Text style={styles.answer}>
+                      {d.label}
+                      {d.scoreText ? <Text style={styles.scoreSub}>  ·  {d.scoreText}</Text> : null}
+                    </Text>
+                  </View>
+                  {d.bars.map((b, bi) => {
+                    const top = b.p === Math.max(...d.bars.map(x => x.p));
+                    return (
+                      <View key={bi} style={styles.barRow}>
+                        <Text style={[styles.barName, top && styles.barNameTop]}>{b.name}</Text>
+                        <View style={styles.barTrack}>
+                          <View
+                            style={[
+                              styles.barFill,
+                              {
+                                width: `${Math.max(2, b.p * 100)}%`,
+                                backgroundColor: top ? C.ink : C.lineHi,
+                              },
+                            ]}
+                          />
+                        </View>
+                        <Text style={[styles.barPct, top && styles.barNameTop]}>
+                          {Math.round(b.p * 100)}%
+                        </Text>
+                      </View>
+                    );
+                  })}
+                </View>
+              ) : (
+                <TouchableOpacity
+                  style={[styles.runBtn, (!model.isReady || busy) && styles.btnOff]}
+                  disabled={!model.isReady || busy}
+                  onPress={() => runOne(i)}>
+                  <Text style={styles.runBtnT}>{isActive ? 'THINKING…' : 'RUN ON DEVICE'}</Text>
+                </TouchableOpacity>
+              )}
             </View>
           );
         })}
 
         <TouchableOpacity
-          style={[styles.btn, (!model.isReady || busy) && styles.btnOff]}
+          style={[styles.cta, (!model.isReady || busy) && styles.btnOff]}
           disabled={!model.isReady || busy}
           onPress={runAll}>
-          <Text style={styles.btnText}>{busy ? 'Running…' : 'Run all in sequence'}</Text>
+          <Text style={styles.ctaT}>{busy ? 'RUNNING…' : 'RUN ALL DECISIONS'}</Text>
         </TouchableOpacity>
 
-        {err ? <Text style={styles.bad}>{err}</Text> : null}
+        <Text style={styles.footer}>
+          MODERNBERT-LARGE · INT8 · EXECUTORCH · REACT NATIVE
+        </Text>
       </ScrollView>
     </SafeAreaView>
   );
 }
 
-function Row({label, value}: {label: string; value: string}) {
-  return (
-    <View style={styles.row}>
-      <Text style={styles.rowL}>{label}</Text>
-      <Text style={styles.rowV}>{value}</Text>
-    </View>
-  );
-}
-
 const styles = StyleSheet.create({
-  root: {flex: 1, backgroundColor: '#0b1220'},
-  content: {padding: 22, gap: 14},
-  title: {color: '#e2e8f0', fontSize: 25, fontWeight: '800', marginTop: 10},
-  subtitle: {color: '#64748b', fontSize: 13, marginBottom: 4},
-  sel: {flexDirection: 'row', flexWrap: 'wrap', gap: 8},
-  chip: {borderWidth: 1, borderColor: '#334155', borderRadius: 20, paddingVertical: 8, paddingHorizontal: 14},
-  chipOn: {backgroundColor: '#38bdf8', borderColor: '#38bdf8'},
-  chipT: {color: '#94a3b8', fontSize: 12, fontWeight: '600'},
-  chipTOn: {color: '#04121f'},
-  card: {backgroundColor: '#0f172a', borderColor: '#1e293b', borderWidth: 1, borderRadius: 14, padding: 15, gap: 6},
-  row: {flexDirection: 'row', justifyContent: 'space-between'},
-  rowL: {color: '#64748b', fontSize: 13},
-  rowV: {color: '#e2e8f0', fontSize: 13, fontWeight: '600'},
-  case: {backgroundColor: '#0f172a', borderColor: '#1e293b', borderWidth: 1, borderRadius: 12, padding: 13, gap: 6},
-  caseHead: {flexDirection: 'row', justifyContent: 'space-between'},
-  caseName: {color: '#94a3b8', fontSize: 13, fontWeight: '600', flexShrink: 1},
-  caseOut: {color: '#38bdf8', fontSize: 14, fontFamily: 'monospace'},
-  caseMs: {color: '#f59e0b', fontSize: 12, fontFamily: 'monospace'},
-  runBtn: {backgroundColor: '#1e293b', borderRadius: 10, paddingVertical: 10, alignItems: 'center', marginTop: 2},
-  runBtnT: {color: '#e2e8f0', fontSize: 13, fontWeight: '700'},
-  btn: {backgroundColor: '#38bdf8', borderRadius: 12, paddingVertical: 15, alignItems: 'center'},
-  btnOff: {opacity: 0.4},
-  btnText: {color: '#04121f', fontSize: 16, fontWeight: '800'},
-  ok: {color: '#34d399', fontSize: 16, fontWeight: '800'},
-  bad: {color: '#f87171', fontSize: 14, fontWeight: '700'},
+  root: {flex: 1, backgroundColor: C.bg},
+  content: {padding: 20, paddingBottom: 44, gap: 14},
+  header: {flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 10},
+  title: {color: C.ink, fontSize: 34, fontWeight: '900', letterSpacing: 6},
+  badge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    borderColor: C.line,
+    borderWidth: 1,
+    paddingVertical: 6,
+    paddingHorizontal: 11,
+  },
+  dot: {width: 6, height: 6, backgroundColor: C.ink},
+  badgeT: {color: C.sub, fontSize: 10, fontWeight: '800', letterSpacing: 1},
+  rule: {height: 1, backgroundColor: C.line, marginTop: 2},
+  subtitle: {color: C.faint, fontSize: 12, letterSpacing: 3, textTransform: 'uppercase', marginTop: -6},
+  blurb: {color: C.sub, fontSize: 15, lineHeight: 23, marginTop: 2},
+  blurbHi: {color: C.ink, fontWeight: '800'},
+
+  card: {backgroundColor: C.card, borderColor: C.line, borderWidth: 1, padding: 18, gap: 7},
+  cardTop: {flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 4},
+  typeTag: {borderColor: C.lineHi, borderWidth: 1, paddingVertical: 3, paddingHorizontal: 8},
+  typeTagT: {color: C.ink, fontSize: 10, fontWeight: '800', letterSpacing: 1.2},
+  caseName: {color: C.sub, fontSize: 12, fontWeight: '700', letterSpacing: 2, flexShrink: 1},
+
+  fieldLabel: {color: C.faint, fontSize: 10, fontWeight: '800', letterSpacing: 1.5, marginTop: 6},
+  state: {color: C.ink, fontSize: 16, lineHeight: 23},
+  question: {color: C.sub, fontSize: 14, lineHeight: 20},
+
+  result: {backgroundColor: C.bg, borderColor: C.line, borderWidth: 1, padding: 14, marginTop: 12, gap: 11},
+  resultHead: {flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between'},
+  decideLabel: {color: C.faint, fontSize: 10, fontWeight: '800', letterSpacing: 1.5},
+  answer: {color: C.ink, fontSize: 24, fontWeight: '900', textTransform: 'capitalize'},
+  scoreSub: {fontSize: 14, fontWeight: '700', color: C.sub},
+  barRow: {flexDirection: 'row', alignItems: 'center', gap: 12},
+  barName: {color: C.faint, fontSize: 12, fontWeight: '600', width: 74, textTransform: 'capitalize'},
+  barNameTop: {color: C.ink},
+  barTrack: {flex: 1, height: 8, backgroundColor: C.track, overflow: 'hidden'},
+  barFill: {height: 8},
+  barPct: {color: C.sub, fontSize: 12, fontWeight: '700', width: 38, textAlign: 'right'},
+
+  runBtn: {borderColor: C.lineHi, borderWidth: 1, paddingVertical: 13, alignItems: 'center', marginTop: 10},
+  runBtnT: {color: C.ink, fontSize: 13, fontWeight: '800', letterSpacing: 1.5},
+  cta: {backgroundColor: C.ink, paddingVertical: 17, alignItems: 'center', marginTop: 4},
+  ctaT: {color: C.bg, fontSize: 15, fontWeight: '900', letterSpacing: 1.5},
+  btnOff: {opacity: 0.35},
+  footer: {color: C.faint, fontSize: 10, textAlign: 'center', letterSpacing: 1.5, marginTop: 8},
 });
 
 export default App;

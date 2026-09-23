@@ -1,13 +1,55 @@
 # laya-for-react-native
 
-Bring **Laya** — the open-source, Jev-compatible **System-1 decision model** — to React Native.
+Run **Laya** — the open-source **System-1 decision model** (ModernBERT-large encoder + typed-decision
+head) — **fully on-device** in a bare **React Native** app via
+[ExecuTorch](https://pytorch.org/executorch/) (`react-native-executorch`).
 
-> ⚠️ Status: project scaffolding. This README first explains *what Laya is* and *how it compares to Jev*
-> (the research the build is based on), then the plan for the RN package.
+> ✅ Status: **working & device-verified on Android.** A `.pte` export pipeline, an int8 model, and a
+> bare-RN demo app that loads the model and runs typed decisions offline on a physical phone.
+> iOS is code-ready (XNNPACK is cross-platform); the Core ML variant needs a Mac to build.
+
+Exported models are on Hugging Face: **[ksanjiv05/laya-for-rn-executorch](https://huggingface.co/ksanjiv05/laya-for-rn-executorch)**.
+
+## What's in here
+
+```
+export/        Python: PyTorch -> ExecuTorch .pte pipeline (export_laya_pte.py, make_testcases.py)
+model-src/     Laya model definition (rl_common.py etc.) from convaiinnovations/laya (Apache-2.0)
+rn-demo/       Bare React Native 0.87 app — loads the .pte, runs typed decisions on-device
+```
+
+## Quickstart (Android)
+
+```bash
+# 1. Export the int8 model (needs torch>=2.11, executorch>=1.5; see export/)
+cd export && python export_laya_pte.py --weight-only --out laya_xnnpack_int8wo.pte
+#    ...or just download it from the HF repo above.
+
+# 2. Push the model onto the device
+adb push laya_xnnpack_int8wo.pte /sdcard/Android/data/com.layaexecutorchdemo/files/laya_int8.pte
+
+# 3. Build & run the app
+cd ../rn-demo && npm install
+node node_modules/react-native-executorch/scripts/download-libs.js   # fetch native ET runtime
+cd android && ./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+The RN ↔ ExecuTorch wiring (native-lib download, AGP-9 gradle patch, `initExecutorch` resource
+fetcher, `@dr.pogodin/react-native-fs`) is documented in the commit history and the
+`react-native-executorch` build notes.
+
+## iOS
+
+The app is autolink-configured for iOS (podspecs present, deployment target 15.1) and the XNNPACK
+backend is cross-platform, so `laya_xnnpack_int8wo.pte` runs on iOS too — build with
+`cd ios && pod install` on a Mac, and place `laya_int8.pte` in the app's Documents directory.
+A Core ML (Neural Engine) variant needs a small graph fix + a Mac to compile — see the HF repo's
+`BACKENDS.md`.
 
 ---
 
-## 1. What is Laya?
+## Background: what is Laya?
 
 **Laya is a *decision model*, not a chat model.** It does **not** generate text. You hand it:
 - a **state** — some JSON your app already has (a support ticket, an email, a log line, a tool call, a retrieved passage), and
