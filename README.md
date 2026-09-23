@@ -42,10 +42,42 @@ fetcher, `@dr.pogodin/react-native-fs`) is documented in the commit history and 
 ## iOS
 
 The app is autolink-configured for iOS (podspecs present, deployment target 15.1) and the XNNPACK
-backend is cross-platform, so `laya_xnnpack_int8wo.pte` runs on iOS too — build with
-`cd ios && pod install` on a Mac, and place `laya_int8.pte` in the app's Documents directory.
-A Core ML (Neural Engine) variant needs a small graph fix + a Mac to compile — see the HF repo's
-`BACKENDS.md`.
+backend is cross-platform, so `laya_xnnpack_int8wo.pte` runs on iOS as-is.
+
+**Export the iOS model on a Mac:**
+
+```bash
+cd export
+
+# Recommended iOS build — int8 XNNPACK (.pte). Also works on Linux; same file runs on Android.
+./export_ios.sh
+#   -> laya_xnnpack_int8wo.pte
+
+# Optional: also attempt the Core ML build (Apple Neural Engine / GPU). macOS only.
+./export_ios.sh --coreml
+#   -> laya_coreml.pte   (experimental — see export/COREML_NOTES.md for the gather-dtype fix)
+```
+
+Or call the exporter directly:
+
+```bash
+python export_laya_pte.py --backend xnnpack --weight-only --out laya_xnnpack_int8wo.pte   # iOS + Android
+python export_laya_pte.py --backend coreml               --out laya_coreml.pte             # macOS only
+```
+
+**Build & run the app on the Mac:**
+
+```bash
+cd rn-demo && npm install
+node node_modules/react-native-executorch/scripts/download-libs.js
+cd ios && pod install && cd ..
+# place laya_xnnpack_int8wo.pte in the app's Documents dir (rename to laya_int8.pte),
+# then build/run from Xcode or:
+npx react-native run-ios
+```
+
+`Platform.select()` in `App.tsx` already resolves `laya_int8.pte` from the iOS Documents dir. A Core ML
+variant needs a one-line int32-index fix + a Mac to compile — see `export/COREML_NOTES.md`.
 
 ---
 
