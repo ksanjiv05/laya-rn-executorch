@@ -67,6 +67,9 @@ def main():
     ap.add_argument("--weight-only", action="store_true",
                     help="int8 WEIGHT-ONLY quantization via torchao.quantize_ (≈4x smaller; "
                          "leaves integer gather/index ops untouched — safest for the custom head)")
+    ap.add_argument("--backend", choices=["xnnpack", "vulkan", "coreml"], default="xnnpack",
+                    help="delegate backend: xnnpack (portable CPU, iOS+Android), "
+                         "vulkan (Android GPU), coreml (iOS Neural Engine/GPU — export on macOS only)")
     args = ap.parse_args()
 
     model_dir = os.path.abspath(args.model_dir)
@@ -113,10 +116,20 @@ def main():
         err = (gl - eager_logits).abs().max().item()
         print(f"      exported-vs-eager max|Δlogits| = {err:.3e}")
 
-    print("[4/5] lower to ExecuTorch + XNNPACK")
+    print(f"[4/5] lower to ExecuTorch + {args.backend}")
     from executorch.exir import to_edge_transform_and_lower, ExecutorchBackendConfig
-    from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
-    lowered = to_edge_transform_and_lower(ep, partitioner=[XnnpackPartitioner()])
+    if args.backend == "xnnpack":
+        from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
+        partitioner = [XnnpackPartitioner()]
+    elif args.backend == "vulkan":
+        # Android GPU. Vulkan prefers fp16; note it currently delegates a subset of ops and
+        # falls back to portable CPU for the rest, so pair with a real device benchmark.
+        from executorch.backends.vulkan.partitioner.vulkan_partitioner import VulkanPartitioner
+        partitioner = [VulkanPartitioner()]
+    else:  # coreml — iOS Neural Engine / GPU; real compile needs macOS coremltools runtime
+        from executorch.backends.apple.coreml.partition.coreml_partitioner import CoreMLPartitioner
+        partitioner = [CoreMLPartitioner()]
+    lowered = to_edge_transform_and_lower(ep, partitioner=partitioner)
     prog = lowered.to_executorch(ExecutorchBackendConfig())
 
     print(f"[5/5] writing {args.out}")
