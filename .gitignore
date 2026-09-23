@@ -1,0 +1,17 @@
+# Python export env
+.venv/
+__pycache__/
+*.pyc
+
+# Large model artifacts — do NOT commit (regenerate with export/export_laya_pte.py)
+model-src/hf/
+export/*.pte
+export/*.pte.data
+*.safetensors
+*.onnx
+*.onnx.data
+
+# RN / Node
+node_modules/
+.expo/
+*.log
