@@ -67,6 +67,9 @@ def main():
     ap.add_argument("--weight-only", action="store_true",
                     help="int8 WEIGHT-ONLY quantization via torchao.quantize_ (≈4x smaller; "
                          "leaves integer gather/index ops untouched — safest for the custom head)")
+    ap.add_argument("--int4", action="store_true",
+                    help="int4 WEIGHT-ONLY quantization via torchao Int4WeightOnlyConfig (~2x smaller "
+                         "than int8; more accuracy loss — verify)")
     ap.add_argument("--backend", choices=["xnnpack", "vulkan", "coreml"], default="xnnpack",
                     help="delegate backend: xnnpack (portable CPU, iOS+Android), "
                          "vulkan (Android GPU), coreml (iOS Neural Engine/GPU — export on macOS only)")
@@ -84,6 +87,10 @@ def main():
         print("[q] applying int8 weight-only quantization (torchao.quantize_ on Linear)")
         from torchao.quantization import quantize_, Int8WeightOnlyConfig
         quantize_(wrapper, Int8WeightOnlyConfig())
+    elif args.int4:
+        print("[q] applying int4 weight-only quantization (torchao.quantize_ on Linear)")
+        from torchao.quantization import quantize_, Int4WeightOnlyConfig
+        quantize_(wrapper, Int4WeightOnlyConfig())
 
     print(f"[2/5] eager forward (seq_len={args.seq_len}, max_opts={args.max_opts})")
     with torch.no_grad():

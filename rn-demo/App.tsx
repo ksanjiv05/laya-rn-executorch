@@ -18,8 +18,11 @@ import {
 import {useExecutorchModule, ScalarType} from 'react-native-executorch/legacy';
 
 const DATA = require('./assets/laya_testcases.json');
-const MODEL_PATH =
-  'file:///sdcard/Android/data/com.layaexecutorchdemo/files/laya_int8.pte';
+const DIR = 'file:///sdcard/Android/data/com.layaexecutorchdemo/files/';
+const MODELS = [
+  {label: 'int8 · CPU (XNNPACK)', path: DIR + 'laya_int8.pte'},
+  {label: 'int8 · GPU (Vulkan)', path: DIR + 'laya_vulkan_int8.pte'},
+];
 
 type CaseResult = {
   name: string;
@@ -40,7 +43,8 @@ function i64(arr: number[]) {
 }
 
 function App(): React.JSX.Element {
-  const model = useExecutorchModule({modelSource: MODEL_PATH});
+  const [sel, setSel] = useState(0);
+  const model = useExecutorchModule({modelSource: MODELS[sel].path});
   const [results, setResults] = useState<CaseResult[]>([]);
   const [running, setRunning] = useState(false);
   const [err, setErr] = useState('');
@@ -112,10 +116,25 @@ function App(): React.JSX.Element {
       <StatusBar barStyle="light-content" />
       <ScrollView contentContainerStyle={styles.content}>
         <Text style={styles.title}>Laya × ExecuTorch</Text>
-        <Text style={styles.subtitle}>real int8 model · {DATA.cases.length}-case benchmark</Text>
+        <Text style={styles.subtitle}>backend benchmark · {DATA.cases.length} cases</Text>
+
+        <View style={styles.sel}>
+          {MODELS.map((m, i) => (
+            <TouchableOpacity
+              key={i}
+              disabled={running}
+              onPress={() => {
+                setSel(i);
+                setResults([]);
+              }}
+              style={[styles.chip, sel === i && styles.chipOn]}>
+              <Text style={[styles.chipT, sel === i && styles.chipTOn]}>{m.label}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
 
         <View style={styles.card}>
-          <Row label="Model" value="Laya int8-WO (603 MB)" />
+          <Row label="Selected" value={MODELS[sel].label} />
           <Row label="Encoder" value="ModernBERT-large + head" />
           <Row
             label="State"
@@ -179,6 +198,17 @@ const styles = StyleSheet.create({
   content: {padding: 22, gap: 14},
   title: {color: '#e2e8f0', fontSize: 25, fontWeight: '800', marginTop: 10},
   subtitle: {color: '#64748b', fontSize: 13, marginBottom: 4},
+  sel: {flexDirection: 'row', flexWrap: 'wrap', gap: 8},
+  chip: {
+    borderWidth: 1,
+    borderColor: '#334155',
+    borderRadius: 20,
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+  },
+  chipOn: {backgroundColor: '#38bdf8', borderColor: '#38bdf8'},
+  chipT: {color: '#94a3b8', fontSize: 12, fontWeight: '600'},
+  chipTOn: {color: '#04121f'},
   card: {
     backgroundColor: '#0f172a',
     borderColor: '#1e293b',
