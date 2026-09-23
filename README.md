@@ -65,6 +65,21 @@ python export_laya_pte.py --backend xnnpack --weight-only --out laya_xnnpack_int
 python export_laya_pte.py --backend coreml               --out laya_coreml.pte             # macOS only
 ```
 
+### int4 (GPU required)
+
+int4 weight-only quantization uses torchao tile-packing kernels that **only run on a CUDA GPU with
+compute capability ≥ 8.0** (A100 / L4 — *not* a T4 or a Turing laptop card). Use the ready-made Colab
+notebook, which installs the toolchain, pulls the weights, quantizes to int4 on the GPU, and downloads
+`laya_xnnpack_int4.pte`:
+
+```
+export/laya_int4_colab.ipynb   →  open in Google Colab, set Runtime = A100/L4 GPU, Run all
+```
+
+Then push it to the device like the int8 model (`adb push … /files/laya_int4.pte`). int4 loses more
+precision than int8 — verify the on-device output against `make_testcases.py` before shipping.
+
+
 **Build & run the app on the Mac:**
 
 ```bash

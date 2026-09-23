@@ -15,3 +15,4 @@ export/*.pte.data
 node_modules/
 .expo/
 *.log
+int4-gpu/
