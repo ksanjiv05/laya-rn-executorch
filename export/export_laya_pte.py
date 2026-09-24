@@ -78,6 +78,7 @@ def main():
     model_dir = os.path.abspath(args.model_dir)
     print(f"[1/5] building model from {model_dir}")
     core, cfg = build(model_dir)
+    core.gather_via_onehot = args.backend == "coreml"  # Core ML can't lower the int gather
     pad_id = 50283  # ModernBERT pad_token_id (from encoder/config.json)
 
     wrapper = ExportWrapper(core).eval()

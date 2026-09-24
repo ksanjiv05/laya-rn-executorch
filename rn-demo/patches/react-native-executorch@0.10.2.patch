@@ -1,0 +1,62 @@
+diff --git a/ios/RnExecutorch.h b/ios/RnExecutorch.h
+index 99f17f58a701328839c780b03e528a1b76454d11..885278b56ded6bea0fd84ece684e5e65d467d1c0 100644
+--- a/ios/RnExecutorch.h
++++ b/ios/RnExecutorch.h
+@@ -1,5 +1,6 @@
+ #import <RnExecutorchSpec/RnExecutorchSpec.h>
++#import <ReactCommon/RCTTurboModuleWithJSIBindings.h>
+ 
+-@interface RnExecutorch : NSObject <NativeRnExecutorchSpec>
++@interface RnExecutorch : NSObject <NativeRnExecutorchSpec, RCTTurboModuleWithJSIBindings>
+ 
+ @end
+diff --git a/ios/RnExecutorch.mm b/ios/RnExecutorch.mm
+index d73302592ab9488ff2cc27a9c5b8433316fac9ac..a242bb8bcfc3ee744dc83b777c20be3e547e3152 100644
+--- a/ios/RnExecutorch.mm
++++ b/ios/RnExecutorch.mm
+@@ -1,14 +1,13 @@
+ #import "RnExecutorch.h"
+ #import "../cpp/RnExecutorch.h"
+-#import <React/RCTBridge+Private.h>
+ #import <jsi/jsi.h>
+ 
++// RN >= 0.87 removed RCTCxxBridge; the runtime is handed to us via
++// RCTTurboModuleWithJSIBindings when the TurboModule is first created.
+ @implementation RnExecutorch {
+-    __weak RCTBridge *_bridge;
++    BOOL _installed;
+ }
+ 
+-@synthesize bridge = _bridge;
+-
+ RCT_EXPORT_MODULE()
+ 
+ - (std::shared_ptr<facebook::react::TurboModule>)getTurboModule:
+@@ -16,20 +15,14 @@ @implementation RnExecutorch {
+     return std::make_shared<facebook::react::NativeRnExecutorchSpecJSI>(params);
+ }
+ 
+-RCT_EXPORT_SYNCHRONOUS_TYPED_METHOD(NSNumber *, install) {
+-    RCTCxxBridge *cxxBridge = (RCTCxxBridge *)self.bridge;
+-
+-    if (cxxBridge == nil)
+-        return @NO;
+-
+-    facebook::jsi::Runtime *jsiRuntime = (facebook::jsi::Runtime *)cxxBridge.runtime;
+-
+-    if (jsiRuntime == nil)
+-        return @NO;
+-
+-    rnexecutorch::install(*jsiRuntime);
++- (void)installJSIBindingsWithRuntime:(facebook::jsi::Runtime &)runtime
++                          callInvoker:(const std::shared_ptr<facebook::react::CallInvoker> &)callInvoker {
++    rnexecutorch::install(runtime);
++    _installed = YES;
++}
+ 
+-    return @YES;
++RCT_EXPORT_SYNCHRONOUS_TYPED_METHOD(NSNumber *, install) {
++    return _installed ? @YES : @NO;
+ }
+ 
+ @end

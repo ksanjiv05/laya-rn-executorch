@@ -1,0 +1,4 @@
+allowBuilds:
+  react-native-executorch: true
+patchedDependencies:
+  react-native-executorch@0.10.2: patches/react-native-executorch@0.10.2.patch

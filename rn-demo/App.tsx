@@ -3,9 +3,9 @@
  *
  * Monochrome, sharp-corner presentation build. Loads the int8 Laya .pte from the device filesystem
  * and shows each test case as a card: the input state, the typed question, and Laya's on-device
- * decision (choice / score / yes-no) with a calibrated confidence bar. No timing.
+ * decision (choice / score / yes-no) with a calibrated confidence bar and on-device inference time.
  */
-import React, {useState} from 'react';
+import React, {useEffect, useState} from 'react';
 import {
   Platform,
   SafeAreaView,
@@ -17,15 +17,18 @@ import {
   View,
 } from 'react-native';
 import {useExecutorchModule, ScalarType} from 'react-native-executorch/legacy';
+import {DocumentDirectoryPath, MainBundlePath, writeFile} from '@dr.pogodin/react-native-fs';
 
 const DATA = require('./assets/laya_testcases.json');
 // The int8 .pte is pushed to the app's on-device storage, per platform:
 //   Android:  adb push laya_xnnpack_int8wo.pte /sdcard/Android/data/<pkg>/files/laya_int8.pte
-//   iOS:      copy laya_int8.pte into the app's Documents dir (e.g. via Xcode "Add Files" as a
-//             bundle resource + copy on first launch, or `xcrun simctl` push to the container).
+//   iOS:      the .pte in assets/models is an Xcode bundle resource (Copy Bundle Resources);
+//             loaded in place. Switch IOS_MODEL + the bundled file to change backend.
+const IOS_MODEL = 'laya_coreml.pte'; // or 'laya_xnnpack_int8wo.pte'
+const BACKEND_LABEL = Platform.OS === 'ios' && IOS_MODEL.includes('coreml') ? 'CORE ML' : 'XNNPACK · INT8';
 const MODEL_PATH = Platform.select({
   android: 'file:///sdcard/Android/data/com.layaexecutorchdemo/files/laya_int8.pte',
-  ios: 'laya_int8.pte', // resolved from the app bundle / Documents by the resource fetcher
+  ios: `file://${MainBundlePath}/${IOS_MODEL}`,
   default: 'laya_int8.pte',
 }) as string;
 
@@ -40,6 +43,14 @@ const C = {
   sub: '#9A9A9A',
   faint: '#5E5E5E',
   track: '#161616',
+  err: '#FF5A5A',
+};
+
+const STATUS_COLOR: Record<string, string> = {
+  LOADING: C.sub,
+  READY: C.ink,
+  RUNNING: C.ink,
+  ERROR: C.err,
 };
 
 const TYPE_TAG: Record<string, string> = {
@@ -53,6 +64,7 @@ type Decision = {
   label: string;
   bars: {name: string; p: number}[];
   scoreText?: string;
+  ms: number;
 };
 
 function softmax(z: number[]): number[] {
@@ -68,9 +80,50 @@ function App(): React.JSX.Element {
   const [out, setOut] = useState<Record<number, Decision>>({});
   const [busy, setBusy] = useState(false);
   const [active, setActive] = useState<number | null>(null);
+  const [errs, setErrs] = useState<Record<number, string>>({});
+  const [loadStart] = useState(() => Date.now());
+  const [loadMs, setLoadMs] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+
+  // Tick while loading so the elapsed time is visible; record total load time once ready.
+  useEffect(() => {
+    if (model.isReady) {
+      setLoadMs(prev => prev ?? Date.now() - loadStart);
+      return;
+    }
+    if (model.error) return;
+    const t = setInterval(() => setNow(Date.now()), 250);
+    return () => clearInterval(t);
+  }, [model.isReady, model.error, loadStart]);
+
+  const status: 'ERROR' | 'LOADING' | 'RUNNING' | 'READY' = model.error
+    ? 'ERROR'
+    : !model.isReady
+    ? 'LOADING'
+    : busy
+    ? 'RUNNING'
+    : 'READY';
+  const statusDetail =
+    status === 'ERROR'
+      ? 'Model failed to load'
+      : status === 'LOADING'
+      ? `Loading model into memory… ${((now - loadStart) / 1000).toFixed(1)}s`
+      : status === 'RUNNING'
+      ? `Running inference${active != null ? ` · case ${active + 1}` : ''}…`
+      : `Loaded in ${((loadMs ?? 0) / 1000).toFixed(1)}s · ready for inference`;
+
+  // Dev builds: mirror model state to Documents/model_status.json so tooling on the Mac can
+  // poll it (xcrun devicectl device copy from ... --domain-type appDataContainer).
+  useEffect(() => {
+    if (!__DEV__ || status === 'RUNNING') return;
+    const error = model.error ? String(model.error.message ?? model.error) : null;
+    const payload = {status, loadMs, error, backend: BACKEND_LABEL, ts: Date.now()};
+    writeFile(`${DocumentDirectoryPath}/model_status.json`, JSON.stringify(payload), 'utf8').catch(() => {});
+  }, [status, loadMs, model.error]);
 
   const decide = async (idx: number): Promise<Decision | null> => {
     const c = DATA.cases[idx];
+    setErrs(({[idx]: _, ...rest}) => rest);
     const inputs = [
       {dataPtr: i64(c.input_ids), sizes: [1, DATA.seq_len], scalarType: ScalarType.LONG},
       {dataPtr: i64(c.attention_mask), sizes: [1, DATA.seq_len], scalarType: ScalarType.LONG},
@@ -82,7 +135,9 @@ function App(): React.JSX.Element {
       },
       {dataPtr: i64([c.qtype]), sizes: [1], scalarType: ScalarType.LONG},
     ];
+    const t0 = Date.now();
     const res = await model.forward(inputs as any);
+    const ms = Date.now() - t0;
     const logits = Array.from(new Float32Array(res[0].dataPtr as ArrayBuffer));
     const k: number = c.k;
     const p = softmax(logits.slice(0, k).map(v => v / c.temperature));
@@ -90,7 +145,7 @@ function App(): React.JSX.Element {
     if (c.question.type === 'choice') {
       const keys: string[] = c.question.criteria;
       const mi = p.indexOf(Math.max(...p));
-      return {kind: 'choice', label: keys[mi], bars: keys.map((name, i) => ({name, p: p[i]}))};
+      return {kind: 'choice', label: keys[mi], bars: keys.map((name, i) => ({name, p: p[i]})), ms};
     } else if (c.question.type === 'score') {
       const labels: string[] = c.question.criteria;
       const score = p.reduce((a, v, i) => a + v * i, 0);
@@ -100,6 +155,7 @@ function App(): React.JSX.Element {
         label: labels[mi],
         scoreText: `${score.toFixed(1)} / ${k - 1}`,
         bars: labels.map((name, i) => ({name, p: p[i]})),
+        ms,
       };
     } else {
       const yes = p[1];
@@ -110,6 +166,7 @@ function App(): React.JSX.Element {
           {name: 'No', p: p[0]},
           {name: 'Yes', p: p[1]},
         ],
+        ms,
       };
     }
   };
@@ -120,7 +177,9 @@ function App(): React.JSX.Element {
     try {
       const d = await decide(idx);
       if (d) setOut(prev => ({...prev, [idx]: d}));
-    } catch {}
+    } catch (e: any) {
+      setErrs(prev => ({...prev, [idx]: String(e?.message ?? e)}));
+    }
     setActive(null);
     setBusy(false);
   };
@@ -132,7 +191,9 @@ function App(): React.JSX.Element {
       try {
         const d = await decide(i);
         if (d) setOut(prev => ({...prev, [i]: d}));
-      } catch {}
+      } catch (e: any) {
+        setErrs(prev => ({...prev, [i]: String(e?.message ?? e)}));
+      }
     }
     setActive(null);
     setBusy(false);
@@ -146,8 +207,8 @@ function App(): React.JSX.Element {
         <View style={styles.header}>
           <Text style={styles.title}>LAYA</Text>
           <View style={styles.badge}>
-            <View style={styles.dot} />
-            <Text style={styles.badgeT}>{model.isReady ? 'ON DEVICE' : 'LOADING'}</Text>
+            <View style={[styles.dot, {backgroundColor: STATUS_COLOR[status]}]} />
+            <Text style={[styles.badgeT, {color: STATUS_COLOR[status]}]}>{status}</Text>
           </View>
         </View>
         <View style={styles.rule} />
@@ -157,6 +218,31 @@ function App(): React.JSX.Element {
           A small model that <Text style={styles.blurbHi}>decides</Text> instead of chatting — running
           fully offline on this phone. No cloud. No API.
         </Text>
+
+        {/* Model status */}
+        <View style={[styles.statusCard, status === 'ERROR' && {borderColor: C.err}]}>
+          <View style={styles.statusHead}>
+            <Text style={styles.fieldLabel}>MODEL</Text>
+            <Text style={[styles.statusVal, {color: STATUS_COLOR[status]}]}>{status}</Text>
+          </View>
+          <Text style={styles.statusDetail}>{statusDetail}</Text>
+          {status === 'LOADING' && model.downloadProgress > 0 && model.downloadProgress < 1 ? (
+            <View style={styles.barTrack}>
+              <View style={[styles.barFill, {width: `${model.downloadProgress * 100}%`, backgroundColor: C.ink}]} />
+            </View>
+          ) : null}
+          {model.error ? <Text style={styles.errText}>{String(model.error.message ?? model.error)}</Text> : null}
+          <View style={styles.metaRow}>
+            <Text style={styles.metaK}>BACKEND</Text>
+            <Text style={styles.metaV}>{BACKEND_LABEL}</Text>
+          </View>
+          <View style={styles.metaRow}>
+            <Text style={styles.metaK}>FILE</Text>
+            <Text style={styles.metaV} numberOfLines={1}>
+              {MODEL_PATH.split('/').pop()}
+            </Text>
+          </View>
+        </View>
 
         {/* Cases */}
         {DATA.cases.map((c: any, i: number) => {
@@ -177,6 +263,7 @@ function App(): React.JSX.Element {
               <Text style={styles.fieldLabel}>ASK</Text>
               <Text style={styles.question}>{c.question.instructions}</Text>
 
+              {errs[i] ? <Text style={styles.errText}>INFERENCE FAILED · {errs[i]}</Text> : null}
               {d ? (
                 <View style={styles.result}>
                   <View style={styles.resultHead}>
@@ -185,6 +272,10 @@ function App(): React.JSX.Element {
                       {d.label}
                       {d.scoreText ? <Text style={styles.scoreSub}>  ·  {d.scoreText}</Text> : null}
                     </Text>
+                  </View>
+                  <View style={styles.timeRow}>
+                    <Text style={styles.decideLabel}>INFERENCE TIME</Text>
+                    <Text style={styles.timeVal}>{Math.round(d.ms)} ms</Text>
                   </View>
                   {d.bars.map((b, bi) => {
                     const top = b.p === Math.max(...d.bars.map(x => x.p));
@@ -229,7 +320,7 @@ function App(): React.JSX.Element {
         </TouchableOpacity>
 
         <Text style={styles.footer}>
-          MODERNBERT-LARGE · INT8 · EXECUTORCH · REACT NATIVE
+          MODERNBERT-LARGE · {BACKEND_LABEL} · EXECUTORCH · REACT NATIVE
         </Text>
       </ScrollView>
     </SafeAreaView>
@@ -272,6 +363,8 @@ const styles = StyleSheet.create({
   decideLabel: {color: C.faint, fontSize: 10, fontWeight: '800', letterSpacing: 1.5},
   answer: {color: C.ink, fontSize: 24, fontWeight: '900', textTransform: 'capitalize'},
   scoreSub: {fontSize: 14, fontWeight: '700', color: C.sub},
+  timeRow: {flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between'},
+  timeVal: {color: C.ink, fontSize: 14, fontWeight: '800', letterSpacing: 1},
   barRow: {flexDirection: 'row', alignItems: 'center', gap: 12},
   barName: {color: C.faint, fontSize: 12, fontWeight: '600', width: 74, textTransform: 'capitalize'},
   barNameTop: {color: C.ink},
@@ -284,6 +377,15 @@ const styles = StyleSheet.create({
   cta: {backgroundColor: C.ink, paddingVertical: 17, alignItems: 'center', marginTop: 4},
   ctaT: {color: C.bg, fontSize: 15, fontWeight: '900', letterSpacing: 1.5},
   btnOff: {opacity: 0.35},
+
+  statusCard: {borderColor: C.line, borderWidth: 1, padding: 16, gap: 8},
+  statusHead: {flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between'},
+  statusVal: {fontSize: 14, fontWeight: '900', letterSpacing: 1.5},
+  statusDetail: {color: C.sub, fontSize: 13},
+  errText: {color: C.err, fontSize: 12, lineHeight: 17},
+  metaRow: {flexDirection: 'row', justifyContent: 'space-between', gap: 12},
+  metaK: {color: C.faint, fontSize: 10, fontWeight: '800', letterSpacing: 1.5},
+  metaV: {color: C.sub, fontSize: 12, fontWeight: '700', flexShrink: 1, textAlign: 'right'},
   footer: {color: C.faint, fontSize: 10, textAlign: 'center', letterSpacing: 1.5, marginTop: 8},
 });
 

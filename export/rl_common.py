@@ -96,6 +96,7 @@ class DecisionModel(nn.Module):
         self.act_head = nn.Sequential(nn.Linear(d + 4, 256), nn.GELU(), nn.Linear(256, n_act))
         self.register_buffer("temperature", torch.ones(3))  # per qtype, fitted post-hoc in evaluate.py
         self.head_checkpointing = False
+        self.gather_via_onehot = False  # set True for Core ML export (see forward)
 
     def forward(self, input_ids, attention_mask, marker_pos, marker_mask, qtype, detach_encoder: bool = False):
         h = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
@@ -109,8 +110,15 @@ class DecisionModel(nn.Module):
                     h = torch.utils.checkpoint.checkpoint(layer, h, None, pad, use_reentrant=False)
                 else:
                     h = layer(h, src_key_padding_mask=pad)
-        idx = marker_pos.clamp(min=0)[:, :, None].expand(-1, -1, h.size(-1))
-        m = torch.gather(h, 1, idx)
+        if self.gather_via_onehot:
+            # Core ML: clamp() on int lowers to fp32 clip, and gather_along_axis rejects fp32 indices.
+            # One-hot matmul selects the same rows exactly (1.0 * h), with no integer index ops.
+            pos = torch.where(marker_pos < 0, torch.zeros_like(marker_pos), marker_pos)
+            onehot = (pos[:, :, None] == torch.arange(h.size(1), device=h.device)[None, None, :]).to(h.dtype)
+            m = torch.bmm(onehot, h)
+        else:
+            idx = marker_pos.clamp(min=0)[:, :, None].expand(-1, -1, h.size(-1))
+            m = torch.gather(h, 1, idx)
         logits = self.scorer(m).squeeze(-1).float()
         logits = logits.masked_fill(~marker_mask, -1e4)
         # act head sees the pooled sequence + detached summary of its own answer distribution

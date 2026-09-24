@@ -1,5 +1,5 @@
 # Python export env
-.venv/
+.venv*/
 __pycache__/
 *.pyc
 
@@ -16,3 +16,14 @@ node_modules/
 .expo/
 *.log
 int4-gpu/
+
+# Bundled model copies in the RN app (regenerate/copy from export/); tiny.pte stays tracked
+rn-demo/assets/models/*.pte
+!rn-demo/assets/models/tiny.pte
+
+# macOS
+.DS_Store
+
+# Accidental root npm/pnpm stubs (the app lives in rn-demo/)
+/package.json
+/pnpm-lock.yaml
